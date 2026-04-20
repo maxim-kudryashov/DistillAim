@@ -13,7 +13,25 @@ from .shot_parameters import ShotParameters
 
 @dataclass
 class SimParameters:
-    """Physical parameters of the robot shooter and ball."""
+    """Physical parameters for the shooter and ball used by the simulator.
+
+    Attributes:
+        ball_mass_kg: Ball mass in kilograms.
+        ball_diameter_m: Ball diameter in meters.
+        drag_coeff: Dimensionless drag coefficient.
+        magnus_coeff: Dimensionless Magnus lift coefficient.
+        air_density: Air density in kg/m^3.
+        exit_height_m: Launch height from the floor in meters.
+        wheel_diameter_m: Flywheel diameter in meters.
+        target_height_m: Target height from the floor in meters.
+        slip_factor: Fraction (0–1) of wheel tangential speed imparted to the ball.
+        fixed_launch_angle_deg: Fixed launch angle in degrees (from horizontal).
+        dt: Integration timestep in seconds.
+        rpm_min: Minimum RPM for binary search.
+        rpm_max: Maximum RPM for binary search.
+        binary_search_iters: Iterations for binary search.
+        max_sim_time: Maximum simulation time in seconds.
+    """
     ball_mass_kg: float         # kg
     ball_diameter_m: float      # m
     drag_coeff: float           # dimensionless (smooth sphere ~0.47)
@@ -49,14 +67,21 @@ class LUTEntry:
 
 
 class ProjectileSimulator:
-    """
-    Simulates a ball flying through the air with drag and Magnus lift.
-    Uses RK4 integration in the vertical plane (x, z).
-    For each distance, binary-searches RPM until the ball arrives at the target height.
-    Generates the 91-point lookup table from 0.50m to 5.00m.
+    """Simulate projectile motion with drag and Magnus lift and produce shot tables.
+
+    Instantiate with SimParameters and optional magnus_sign (+1 for topspin, -1 for backspin).
     """
 
     def __init__(self, params: SimParameters, magnus_sign: float = 1.0) -> None:
+        """Initialize simulator constants.
+
+        Parameters:
+            params: Simulation parameters (SimParameters).
+            magnus_sign: +1 for topspin (upward lift), -1 for backspin.
+
+        Returns:
+            None
+        """
         self.params = params
         # +1 for topspin (upward lift, default), -1 for backspin (downward push)
         self.magnus_sign = magnus_sign
@@ -66,17 +91,28 @@ class ProjectileSimulator:
         self.k_magnus = (params.air_density * params.magnus_coeff * area) / (2.0 * params.ball_mass_kg)
 
     def exit_velocity(self, rpm: float) -> float:
-        """
-        RPM to ball exit speed. slipFactor (0–1) = how much surface speed transfers to ball (linear relationship).
+        """Convert shooter RPM to ball exit velocity.
+
+        Parameters:
+            rpm: Wheel rotational speed in revolutions per minute.
+
+        Returns:
+            Exit speed of the ball in meters per second.
         """
         p = self.params
         return p.slip_factor * rpm * math.pi * p.wheel_diameter_m / 60.0
 
     def simulate(self, rpm: float, target_distance_m: float,
                  launch_angle_deg: float | None = None) -> TrajectoryResult:
-        """
-        Simulate trajectory with RK4 integration.
-        Returns TrajectoryResult with z height at target, TOF, and diagnostics.
+        """Simulate a 2D trajectory using RK4 integration.
+
+        Parameters:
+            rpm: Launcher wheel RPM.
+            target_distance_m: Horizontal distance to the target in meters.
+            launch_angle_deg: Launch angle in degrees; if None uses fixed_launch_angle_deg.
+
+        Returns:
+            TrajectoryResult with height at target, time of flight, reachability and diagnostics.
         """
         if launch_angle_deg is None:
             launch_angle_deg = self.params.fixed_launch_angle_deg
@@ -146,10 +182,13 @@ class ProjectileSimulator:
         )
 
     def _derivatives(self, state: list) -> list:
-        """
-        state = [x, z, vx, vz]
-        ax = -kDrag * |v| * vx
-        az = -g - kDrag * |v| * vz + kMagnus * |v|^2
+        """Compute derivatives for RK4 integration.
+
+        Parameters:
+            state: [x, z, vx, vz]
+
+        Returns:
+            List [dx/dt, dz/dt, dvx/dt, dvz/dt].
         """
         svx = state[2]
         svz = state[3]
@@ -162,7 +201,15 @@ class ProjectileSimulator:
 
     def find_rpm_for_distance(self, distance_m: float,
                                launch_angle_deg: float | None = None) -> LUTEntry:
-        """Binary search for the RPM at a specific launch angle that puts the ball at target height."""
+        """Binary-search RPM to reach target height at a given distance.
+
+        Parameters:
+            distance_m: Horizontal distance to target in meters.
+            launch_angle_deg: Optional launch angle in degrees; uses fixed angle if None.
+
+        Returns:
+            LUTEntry with rpm, time-of-flight and reachability flag.
+        """
         if launch_angle_deg is None:
             launch_angle_deg = self.params.fixed_launch_angle_deg
 
@@ -219,7 +266,16 @@ class ProjectileSimulator:
                      min_dist_m: float = 0.50,
                      max_dist_m: float = 5.00,
                      step_m: float = 0.05) -> List[LUTEntry]:
-        """Generate the full lookup table. Default: 0.50m to 5.00m in 5cm steps (91 entries)."""
+        """Generate a lookup table of RPMs for distances.
+
+        Parameters:
+            min_dist_m: Minimum distance in meters.
+            max_dist_m: Maximum distance in meters.
+            step_m: Step between distances in meters.
+
+        Returns:
+            List of LUTEntry objects (one per distance step).
+        """
         entries: List[LUTEntry] = []
         distance = min_dist_m
         while distance <= max_dist_m + step_m * 0.01:
@@ -230,12 +286,74 @@ class ProjectileSimulator:
             distance += step_m
         return entries
 
-    def generate_shot_table(self, n_points: int = 91) -> List[ShotParameters]:
+    def generate_variable_angle_shot_table(
+            self,
+            min_angle_deg: float,
+            max_angle_deg: float,
+            angle_step_deg: float,
+            min_dist_m: float = 0.50,
+            max_dist_m: float = 5.00,
+            step_m: float = 0.05,
+    ) -> List[ShotParameters]:
+        """Find best RPM and angle per distance by sweeping angles.
+
+        Parameters:
+            min_angle_deg: Minimum launch angle in degrees.
+            max_angle_deg: Maximum launch angle in degrees.
+            angle_step_deg: Angle increment in degrees.
+            min_dist_m: Minimum distance in meters.
+            max_dist_m: Maximum distance in meters.
+            step_m: Distance step in meters.
+
+        Returns:
+            List of ShotParameters for reachable shots (best rpm and hood angle per distance).
         """
-        Produces the 91-point static LUT across the legal shooting range (0.50m–5.00m).
-        Returns reachable entries only, with the fixed angle baked in.
+        result = []
+        distance = min_dist_m
+        while distance <= max_dist_m + step_m * 0.01:
+            distance = round(distance * 100.0) / 100.0
+            best_rpm, best_angle, best_tof = float("inf"), 0.0, 0.0
+            found = False
+            angle = min_angle_deg
+            while angle <= max_angle_deg + 0.001:
+                entry = self.find_rpm_for_distance(distance, angle)
+                if entry.reachable and entry.rpm < best_rpm:
+                    best_rpm, best_angle, best_tof = entry.rpm, angle, entry.tof
+                    found = True
+                angle += angle_step_deg
+            if found:
+                result.append(ShotParameters(
+                    distance=distance, rpm=best_rpm,
+                    hood_angle=best_angle, time_of_flight=best_tof,
+                ))
+            distance += step_m
+        return result
+
+    def generate_shot_table(
+            self,
+            n_points: int = 91,
+            min_dist_m: float = 0.50,
+            max_dist_m: float = 5.00,
+    ) -> List[ShotParameters]:
+        """Produce a fixed-angle LUT of shots across a distance range.
+        Fixed-hood LUT sampled at n_points evenly-spaced distances from
+        min_dist_m to max_dist_m. Returns reachable entries only — the
+        returned list may be shorter than n_points if the shooter cannot
+        reach some distances within the configured RPM range.
+
+        For adjustable-hood robots, use generate_variable_angle_shot_table() instead.
+        Parameters:
+            n_points: Number of entries to produce.
+            min_dist_m: Minimum distance in meters.
+            max_dist_m: Maximum distance in meters.
+
+        Returns:
+            List of ShotParameters for reachable shots using the fixed launch angle.
         """
-        entries = self.generate_lut()
+
+        # Note: sampling from n_points, but returns reachable entries only. Return list may be less than n_points.
+        step = (max_dist_m - min_dist_m) / (n_points - 1)
+        entries = self.generate_lut(step_m=step)
         result: List[ShotParameters] = []
         for e in entries:
             if e.reachable:
@@ -248,11 +366,51 @@ class ProjectileSimulator:
         return result
 
     def get_k_drag(self) -> float:
+        """Return computed drag constant k_drag."""
         return self.k_drag
 
     def get_k_magnus(self) -> float:
+        """Return computed Magnus constant k_magnus."""
         return self.k_magnus
+
+    @staticmethod
+    def rpm_to_exit_velocity(rpm: float, wheel_diameter_m: float, slip_factor: float) -> float:
+        """Convert RPM to exit velocity.
+
+        Parameters:
+            rpm: Rotational speed in RPM.
+            wheel_diameter_m: Wheel diameter in meters.
+            slip_factor: Fraction (0–1) of wheel speed transferred to ball.
+
+        Returns:
+            Exit velocity in m/s.
+        """
+        return slip_factor * rpm * math.pi * wheel_diameter_m / 60.0
+
+    @staticmethod
+    def exit_velocity_to_rpm(exit_vel_mps: float, wheel_diameter_m: float, slip_factor: float) -> float:
+        """Convert exit velocity to required RPM.
+
+        Parameters:
+            exit_vel_mps: Desired exit velocity in m/s.
+            wheel_diameter_m: Wheel diameter in meters.
+            slip_factor: Fraction (0–1) of wheel speed transferred to ball.
+
+        Returns:
+            Required RPM.
+        """
+        return exit_vel_mps * 60.0 / (slip_factor * math.pi * wheel_diameter_m)
 
 
 def _add_scaled(base: list, delta: list, scale: float) -> list:
+    """Return base + delta * scale elementwise.
+
+    Parameters:
+        base: Base vector.
+        delta: Delta vector.
+        scale: Scalar multiplier.
+
+    Returns:
+        New list with scaled addition.
+    """
     return [base[i] + delta[i] * scale for i in range(len(base))]
